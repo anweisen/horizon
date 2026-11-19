@@ -6,8 +6,9 @@ use std::{error::Error, fs, io::Write, path::PathBuf};
 pub fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = crate::args().collect();
     let root = PathBuf::from(&args[1]);
-    let providers: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(root.join("assets/minecraft/font/default.json"))?)?;
+    let providers: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        root.join("assets/minecraft/font/default.json"),
+    )?)?;
     let font = Font::metrics(&ResourceSource::directory(root));
     let mut out = fs::File::create(&args[2])?;
     for index in 0..providers["providers"].as_array().map_or(0, Vec::len) {

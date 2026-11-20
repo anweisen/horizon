@@ -39,12 +39,14 @@ pub mod import;
 mod io_pool;
 pub mod menu;
 pub mod menu_extra_rev;
+pub mod packet_counts;
 #[cfg(test)]
 mod payload_bounds_tests;
 pub mod player_shown;
 pub mod playerdata;
 pub mod prediction;
 pub mod recipes;
+mod recording;
 mod registry_names;
 pub mod scoreboard;
 mod sound_order;

@@ -145,7 +145,22 @@ pub struct Sprites {
     /// Textures [`Sprites::prefetch`] decoded ahead of their insert, by sprite name or
     /// resource path.
     ready: std::collections::HashMap<String, crate::sprite_cache::Decoded>,
+    /// Textures past [`max_layers`] that the missing texture stands in for
+    /// ([`Sprites::plan_within_capacity`]).
+    dropped: std::collections::HashSet<String>,
+    /// The one missing texture layer those share.
+    overflow_layer: Option<u32>,
 }
+/// The most block sprite layers the renderer draws from: its arrays
+/// (`gfx::SPRITE_ARRAYS`) of the layers known before the GPU is (`gfx::sprite_split`,
+/// 2048 unless `HORIZON_SPRITE_SPLIT` asks for fewer). A GPU that holds fewer per array
+/// still refuses more, as before.
+pub fn max_layers() -> usize {
+    crate::gfx::SPRITE_ARRAYS as usize * crate::gfx::sprite_split() as usize
+}
+/// Layers [`Sprites::plan_within_capacity`] keeps free for what later loaders add
+/// (connected-texture tiles, run-time sprites).
+const LATE_LAYERS: usize = 512;
 /// Edge length of vanilla's block textures: the smallest array layer.
 pub const SPRITE_SIZE: u32 = 16;
 /// The largest sprite array (all layers of the top mip level) when the settings leave it to
@@ -396,6 +411,9 @@ impl Sprites {
     }
     /// Like `insert`, but refuses unreadable or oversized PNG data before decoding.
     pub fn insert_limited(&mut self, name: &str, max: u64) -> Result<u32> {
+        if self.dropped.contains(name) {
+            return Ok(self.overflow_layer());
+        }
         let bytes = self.limited_png(name, max)?;
         if let Some(layer) = self.layers.get(name) {
             return Ok(*layer);
@@ -410,6 +428,9 @@ impl Sprites {
         if let Some(layer) = self.layers.get(name) {
             return Ok(*layer);
         }
+        if self.dropped.contains(name) {
+            return Ok(self.overflow_layer());
+        }
         let loaded = self.load(name, None);
         self.or_missing(name, loaded)
     }
@@ -422,28 +443,106 @@ impl Sprites {
                 if name != "minecraft:missingno" {
                     log::warn!("Horizon: using the missing texture for {name}: {e}");
                 }
-                // MissingTextureAtlasSprite.generateMissingImage: 16x16,
-                // magenta and black quarters.
-                let frame: Vec<u8> = (0..SPRITE_SIZE * SPRITE_SIZE)
-                    .flat_map(|i| {
-                        let (x, y) = (i % SPRITE_SIZE, i / SPRITE_SIZE);
-                        if (y < SPRITE_SIZE / 2) ^ (x < SPRITE_SIZE / 2) {
-                            [248, 0, 248, 255]
-                        } else {
-                            [0, 0, 0, 255]
-                        }
-                    })
-                    .collect();
-                let layer = u32::try_from(self.native.len())?;
-                self.opaque.push(true);
-                self.pbr.push([None, None]);
-                self.translucent.push(false);
-                self.mips.push(crate::mipmap::Settings::default());
+                // Past the renderer's layers, the shared missing texture.
+                let layer = if self.full() {
+                    self.overflow_layer()
+                } else {
+                    self.push_missing()?
+                };
                 self.layers.insert(name.to_owned(), layer);
-                self.native.push((SPRITE_SIZE, Arc::new(vec![frame]), 0));
                 Ok(layer)
             }
         }
+    }
+    /// A new layer of vanilla's missing texture (`MissingTextureAtlasSprite.generateMissingImage`:
+    /// 16x16, magenta and black quarters), under no name.
+    fn push_missing(&mut self) -> Result<u32> {
+        let frame: Vec<u8> = (0..SPRITE_SIZE * SPRITE_SIZE)
+            .flat_map(|i| {
+                let (x, y) = (i % SPRITE_SIZE, i / SPRITE_SIZE);
+                if (y < SPRITE_SIZE / 2) ^ (x < SPRITE_SIZE / 2) {
+                    [248, 0, 248, 255]
+                } else {
+                    [0, 0, 0, 255]
+                }
+            })
+            .collect();
+        let layer = u32::try_from(self.native.len())?;
+        self.opaque.push(true);
+        self.pbr.push([None, None]);
+        self.translucent.push(false);
+        self.mips.push(crate::mipmap::Settings::default());
+        self.native.push((SPRITE_SIZE, Arc::new(vec![frame]), 0));
+        Ok(layer)
+    }
+    /// Whether one more layer would pass [`max_layers`] (keeping room for the shared missing
+    /// texture's own).
+    fn full(&self) -> bool {
+        self.native.len() + usize::from(self.overflow_layer.is_none()) >= max_layers()
+    }
+    /// Fit a loader's textures (`names`, about to be inserted) within [`max_layers`], with
+    /// room left for later loaders: past it the GPU arrays can't hold them and the game
+    /// would not start. The mod namespaces with the most new textures give theirs up first,
+    /// in reverse name order, until the rest fit; the missing texture stands in for them.
+    /// Vanilla's textures are never given up. A pack that fits is left as it is.
+    pub fn plan_within_capacity<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        self.plan_within(names, max_layers().saturating_sub(LATE_LAYERS));
+    }
+    fn plan_within<'a>(&mut self, names: impl IntoIterator<Item = &'a str>, capacity: usize) {
+        let new: std::collections::BTreeSet<&str> = names
+            .into_iter()
+            .filter(|n| !self.layers.contains_key(*n) && !self.dropped.contains(*n))
+            .collect();
+        let mut over = (self.native.len() + new.len()).saturating_sub(capacity);
+        if over == 0 {
+            return;
+        }
+        // The missing texture's own layer.
+        over += usize::from(self.overflow_layer.is_none());
+        let mut by_namespace: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for name in &new {
+            match name.split_once(':') {
+                Some((ns, _)) if ns != "minecraft" => {
+                    by_namespace.entry(ns).or_default().push(name)
+                }
+                _ => {}
+            }
+        }
+        let mut namespaces: Vec<_> = by_namespace.into_iter().collect();
+        namespaces.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+        let mut given_up = Vec::new();
+        // Each name keeps a layer, the missing texture's: geometry that finds its sprites by
+        // name (`sprite_layers`, a native mod's section geometry) draws the checkerboard
+        // instead of leaving the face out.
+        let missing = self.overflow_layer();
+        for (ns, names) in namespaces {
+            if over == 0 {
+                break;
+            }
+            let take = names.len().min(over);
+            for name in names.iter().rev().take(take) {
+                self.dropped.insert((*name).to_owned());
+                self.layers.insert((*name).to_owned(), missing);
+            }
+            over -= take;
+            given_up.push(format!("{ns} ({take})"));
+        }
+        log::warn!(
+            "Horizon: block textures past the {} layers the renderer draws from; \
+             the missing texture stands in for {}",
+            max_layers(),
+            given_up.join(", ")
+        );
+    }
+    /// The missing texture layer the textures past [`max_layers`] share, under no name of its
+    /// own.
+    fn overflow_layer(&mut self) -> u32 {
+        if let Some(layer) = self.overflow_layer {
+            return layer;
+        }
+        let layer = self.push_missing().unwrap_or(0);
+        self.overflow_layer = Some(layer);
+        layer
     }
     /// Decode on every thread the textures about to be inserted: sprite names, or resource
     /// paths outside `textures/` (as [`Sprites::insert_file`] takes them). A loader that adds
@@ -456,6 +555,7 @@ impl Sprites {
             .into_iter()
             .filter(|name| {
                 !self.layers.contains_key(*name)
+                    && !self.dropped.contains(*name)
                     && !self.ready.contains_key(*name)
                     && self.disk.as_ref().is_none_or(|d| d.get(name).is_none())
             })
@@ -609,7 +709,9 @@ impl Sprites {
             .collect::<Result<Vec<_>>>()?;
         // Where Fusion doesn't draw the sheet (items, other models), the lone tile rather than
         // the whole sheet squeezed square, whose size would set every layer's.
-        if let (Some(&own), Some(&first)) = (self.layers.get(name), tiles.iter().flatten().next()) {
+        if let (Some(&own), Some(&first)) = (self.layers.get(name), tiles.iter().flatten().next())
+            && Some(own) != self.overflow_layer
+        {
             self.show_as(own, first);
         }
         Ok(tiles)
@@ -688,11 +790,12 @@ impl Sprites {
         // Layers are square; a frame of another shape is nearest-resampled to
         // its longer side so UVs (normalized per layer) are unchanged.
         let side = width.max(height);
+        check_frames(side, count).map_err(|e| format!("sprite {name}: {e}"))?;
         let mut frames = Vec::new();
         for index in 0..count {
             let x = index % columns * width;
             let y = index / columns * height;
-            let mut frame = Vec::with_capacity((side * side * 4) as usize);
+            let mut frame = Vec::with_capacity(side as usize * side as usize * 4);
             for row in 0..side {
                 let source_row = y + row * height / side;
                 for column in 0..side {
@@ -789,6 +892,13 @@ impl Sprites {
             self.layers.insert(name.to_owned(), same);
             return Ok(same);
         }
+        // Past what the renderer draws from, a texture no plan foresaw shows missing too
+        // (with room for the missing texture's own layer).
+        if self.full() {
+            let layer = self.overflow_layer();
+            self.layers.insert(name.to_owned(), layer);
+            return Ok(layer);
+        }
         if let Some(key) = still {
             self.still.insert(key, layer);
         }
@@ -818,6 +928,21 @@ impl Sprites {
     }
 }
 
+/// Refuses a sprite's frames before their square layers are made. A frame of any shape becomes a
+/// `side` x `side` layer, so a 32768x1 image of a few hundred bytes would otherwise ask for 4 GiB.
+/// A side may be at most [`MAX_ATLAS_SIZE`](crate::hud::MAX_ATLAS_SIZE), and all `count` squares
+/// together at most a full atlas, the ceiling [`crate::hud::read_png`] puts on the image.
+pub(crate) fn check_frames(side: u32, count: u32) -> std::result::Result<(), String> {
+    let atlas = u128::from(crate::hud::MAX_ATLAS_SIZE);
+    let texels = u128::from(count) * u128::from(side) * u128::from(side);
+    if u128::from(side) > atlas || texels > atlas * atlas {
+        return Err(format!(
+            "{count} frames of {side}x{side} are larger than any atlas"
+        ));
+    }
+    Ok(())
+}
+
 /// A PNG's width, height and pixels as RGBA. From the prepared data file
 /// when it holds the texture: no file opened per texture, nor for its absent
 /// LabPBR maps.
@@ -825,16 +950,7 @@ fn read_rgba(source: &ResourceSource, path: &str) -> Result<(u32, u32, Vec<u8>)>
     decode_rgba(&source.read(path)?)
 }
 pub(crate) fn decode_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    decoder.ignore_checksums(true);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info()?;
-    let mut bytes = vec![
-        0;
-        reader
-            .output_buffer_size()
-            .ok_or("sprite exceeds decoder limits")?
-    ];
+    let (mut reader, mut bytes) = crate::hud::read_png(bytes)?;
     let info = reader.next_frame(&mut bytes)?;
     let channels = info.color_type.samples();
     let mut pixels = Vec::with_capacity(info.width as usize * info.height as usize * 4);
@@ -893,11 +1009,12 @@ fn pbr_map(
         return None;
     }
     let side = w.max(h);
+    check_frames(side, columns * rows).ok()?;
     let output_side = side_within(side, LAYERS_AT_LEAST, max_map_bytes()).min(side);
     let frames = (0..columns * rows)
         .map(|index| {
             let (x, y) = (index % columns * w, index / columns * h);
-            let mut frame = Vec::with_capacity((side * side * 4) as usize);
+            let mut frame = Vec::with_capacity(side as usize * side as usize * 4);
             for row in 0..side {
                 for column in 0..side {
                     let offset =
@@ -966,6 +1083,38 @@ pub(crate) fn sprite_mipmap_limit(requested: u32, size: u32, minimum: u32, avail
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past the arrays' layers, the namespaces with the most new textures give theirs up
+    /// first and share the missing texture, under their own names; vanilla's are never
+    /// given up.
+    #[test]
+    fn textures_past_the_layers_give_way_by_namespace() {
+        let mut sprites = Sprites::default();
+        let names = [
+            "big:block/a",
+            "big:block/b",
+            "big:block/c",
+            "small:block/x",
+            "minecraft:block/stone",
+        ];
+        sprites.plan_within(names, 4);
+        // Five new and four fit, one of them the missing texture's: two give way.
+        let dropped: std::collections::BTreeSet<_> = sprites.dropped.iter().cloned().collect();
+        assert_eq!(
+            dropped,
+            ["big:block/b".to_owned(), "big:block/c".to_owned()].into()
+        );
+        let missing = sprites.insert("big:block/c").unwrap();
+        assert_eq!(sprites.insert("big:block/b").unwrap(), missing);
+        assert_eq!(sprites.count(), 1);
+        // Found by name too, as geometry that never inserts looks them up.
+        assert_eq!(sprites.layers.get("big:block/b"), Some(&missing));
+        assert_eq!(sprites.layers.get("big:block/a"), None);
+        // A load that fits gives nothing up.
+        let mut fits = Sprites::default();
+        fits.plan_within(names, 5);
+        assert!(fits.dropped.is_empty());
+    }
     use std::fs::{self, File};
     #[test]
     fn archive_sprites_keep_deferred_reads_and_cache_on_their_reload_snapshot() -> Result<()> {
@@ -1717,5 +1866,91 @@ mod tests {
         let stepped = test_clip(16, 0, r#"{"frametime":4}"#);
         assert_eq!(stepped.blend(1), blend(0, 0, 0));
         assert_eq!(stepped.blend(5), blend(1, 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod png_size_tests {
+    use crate::hud::{claimed_size_png, grey_png};
+
+    /// A block texture whose header claims more pixels than a full atlas is refused from its
+    /// header, as an undecodable one is, before memory for its pixels is reserved.
+    #[test]
+    fn a_sprite_claiming_a_huge_size_is_refused() {
+        let error = super::decode_rgba(&claimed_size_png(16_385, 16_384)).unwrap_err();
+        assert!(
+            error.to_string().contains("16385x16384 PNG is larger"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_sprite_at_the_side_limit_still_decodes() {
+        let side = crate::atlas_sources::MAX_SPRITE_SIDE as u32;
+        let (width, height, rgba) = super::decode_rgba(&grey_png(side, 1)).unwrap();
+        assert_eq!((width, height, rgba.len()), (side, 1, side as usize * 4));
+    }
+
+    fn decode_sprite(
+        png: &[u8],
+        mcmeta: Option<&str>,
+    ) -> crate::Result<crate::sprite_cache::Decoded> {
+        let path = "assets/minecraft/textures/block/test.png";
+        let files = mcmeta.map(|text| {
+            (
+                format!("{path}.mcmeta"),
+                horizon_assets::resource_source::Resource::bytes(text.as_bytes().to_vec()),
+            )
+        });
+        let source = super::ResourceSource::indexed(files.into_iter().collect());
+        super::Sprites::decode_file_data(&source, path, "minecraft:block/test", Some(png))
+    }
+
+    /// A real 32768x1 (or 1x32768) PNG is a few hundred bytes, decodes to 128 KiB, and its
+    /// square layer would be 4 GiB: it is refused before the square is made.
+    #[test]
+    fn a_sprite_whose_square_frame_no_atlas_holds_is_refused() {
+        let side = crate::atlas_sources::MAX_SPRITE_SIDE as u32;
+        for (width, height) in [(side, 1), (1, side)] {
+            let error = decode_sprite(&grey_png(width, height), None).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("1 frames of 32768x32768 are larger"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tall_animation_strip_still_loads() {
+        let decoded = decode_sprite(&grey_png(16, 64), Some(r#"{"animation":{}}"#)).unwrap();
+        assert_eq!((decoded.side, decoded.frames.len()), (16, 4));
+        assert_eq!(decoded.frames[3], [128, 128, 128, 255].repeat(256));
+    }
+
+    /// A strip of 16x16 frames a little over 32768 pixels tall (about 2 MiB) loads in the Java
+    /// game: its sheet is longer than any texture side, its frames are small.
+    #[test]
+    fn a_strip_longer_than_any_texture_side_loads() {
+        let height = crate::atlas_sources::MAX_SPRITE_SIDE as u32 + 16;
+        let decoded = decode_sprite(&grey_png(16, height), Some(r#"{"animation":{}}"#)).unwrap();
+        assert_eq!(
+            (decoded.side, decoded.frames.len()),
+            (16, height as usize / 16)
+        );
+    }
+
+    /// The largest frame the check lets through is 1 GiB, too heavy to decode in CI: its edges
+    /// are tested on the check alone.
+    #[test]
+    fn frames_are_bounded_by_the_atlas() {
+        let atlas = crate::hud::MAX_ATLAS_SIZE;
+        assert_eq!(super::check_frames(atlas, 1), Ok(()));
+        assert!(super::check_frames(atlas + 1, 1).is_err());
+        assert!(super::check_frames(atlas, 2).is_err());
+        assert_eq!(super::check_frames(16, atlas * atlas / 256), Ok(()));
+        assert!(super::check_frames(16, atlas * atlas / 256 + 1).is_err());
+        assert!(super::check_frames(u32::MAX, u32::MAX).is_err());
     }
 }
